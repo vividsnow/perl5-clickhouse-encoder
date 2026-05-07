@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  linux:
+    name: "Linux / Perl ${{ matrix.perl }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ["5.40", "5.38", "5.36", "5.32", "5.20"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+          install-modules-with: cpanm
+
+      - name: Show perl
+        run: |
+          perl -v
+          perl -V:ivsize -V:nvsize
+
+      - name: Install recommended compression deps
+        run: cpanm --notest Compress::LZ4 Compress::Zstd IO::Compress::Gzip
+
+      - name: Build
+        run: |
+          perl Makefile.PL
+          make
+
+      - name: Run unit tests
+        run: find t -maxdepth 1 -name '*.t' ! -name 'live.t' -print0 | sort -z | xargs -0 prove -bv
+
+      - name: Install ClickHouse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-transport-https ca-certificates dirmngr
+          curl -fsSL "https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key" | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          sudo apt-get install -y clickhouse-server clickhouse-client
+          clickhouse-server --version
+
+      - name: Run live tests
+        run: prove -bv t/live.t
+
+  macos:
+    name: "macOS / Perl ${{ matrix.perl }}"
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ["5.40", "5.38"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install recommended compression deps
+        run: cpanm --notest Compress::LZ4 Compress::Zstd IO::Compress::Gzip
+
+      - name: Build & test (no live CH on macOS)
+        run: |
+          perl Makefile.PL
+          make
+          find t -maxdepth 1 -name '*.t' ! -name 'live.t' -print0 | sort -z | xargs -0 prove -bv
+
+  threaded-perl:
+    name: "Threaded Perl"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up threaded perl 5.40
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: "5.40"
+          multi-thread: true
+
+      - name: Verify multiplicity
+        run: perl -V:usemultiplicity -V:useithreads
+
+      - name: Install recommended compression deps
+        run: cpanm --notest Compress::LZ4 Compress::Zstd IO::Compress::Gzip
+
+      - name: Build & test (catches latent aTHX_ bugs)
+        run: |
+          perl Makefile.PL
+          make
+          find t -maxdepth 1 -name '*.t' ! -name 'live.t' -print0 | sort -z | xargs -0 prove -bv
+
+  release-tests:
+    name: "Author tests (valgrind, ASAN, kwalitee)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up perl 5.40
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: "5.40"
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          cpanm --notest Test::Kwalitee Test::Pod Test::CheckManifest Test::Perl::Critic Test::CPAN::Changes
+
+      - name: Build
+        run: |
+          perl Makefile.PL
+          make
+
+      - name: Author tests
+        env:
+          RELEASE_TESTING: 1
+        run: prove -bv xt/leaks.t xt/asan.t xt/manifest.t xt/pod.t xt/kwalitee.t xt/cpan-changes.t
+        continue-on-error: true   # author tests are advisory in CI
