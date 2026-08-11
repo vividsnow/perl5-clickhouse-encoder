@@ -10,3 +10,5 @@ MYMETA.*
 MANIFEST.bak
 *.tar.gz
 .claude/
+.pcg/
+ClickHouse-Encoder-*/
