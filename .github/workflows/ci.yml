@@ -50,7 +50,7 @@ jobs:
           clickhouse-server --version
 
       - name: Run live tests
-        run: prove -bv t/live.t
+        run: prove -bv t/live.t t/native-prefixes.t
 
   macos:
     name: "macOS / Perl ${{ matrix.perl }}"
@@ -116,7 +116,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y valgrind
-          cpanm --notest Test::Kwalitee Test::Pod Test::CheckManifest Test::Perl::Critic Test::CPAN::Changes
+          cpanm --notest Compress::LZ4 Compress::Zstd BSD::Resource Test::Kwalitee Test::Pod Test::CheckManifest Test::Perl::Critic Test::CPAN::Changes Test::CPAN::Meta Test::CPAN::Meta::JSON Test::Prereq
 
       - name: Build
         run: |
@@ -126,5 +126,9 @@ jobs:
       - name: Author tests
         env:
           RELEASE_TESTING: 1
-        run: prove -bv xt/leaks.t xt/asan.t xt/manifest.t xt/pod.t xt/kwalitee.t xt/cpan-changes.t
-        continue-on-error: true   # author tests are advisory in CI
+        run: |
+          make distdir
+          cd ClickHouse-Encoder-*
+          perl Makefile.PL
+          make
+          prove -bv t xt
