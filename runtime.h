@@ -20,6 +20,9 @@ typedef struct {
 typedef struct {
     Column *columns;
     int num_columns;
+    CHTimezone *zones;
+    char *timezone;
+    int empty_as_null;
 } Encoder;
 
 /* Streamer: collects rows in an AV and flushes one Native block per
@@ -42,7 +45,8 @@ typedef struct {
 
 /* Encode `rows_av` (an AV of arrayrefs, one per row) into `buf`. Validates
  * shape per Encoder schema; croaks on malformed input. */
-void do_encode(pTHX_ Encoder *enc, AV *rows_av, Buffer *buf);
+void do_encode(pTHX_ Encoder *enc, AV *rows_av, Buffer *buf, const SSize_t *positions);
+void configure_encoder(pTHX_ Encoder *enc, const char *timezone, int empty_as_null);
 
 /* Encode `batch` into a fresh Native block and pass the bytes to `writer`.
  * Wrapped in ENTER/SAVETMPS/FREETMPS/LEAVE so per-batch mortals don't

@@ -40,6 +40,50 @@ static UV tcp_read_varint(pTHX_ const unsigned char *p, UV buf_len,
     return v;
 }
 
+static SSize_t *encode_positions(pTHX_ Encoder *enc, int count, SV **args) {
+    SSize_t *positions = NULL;
+    int i;
+    if (count % 2) croak("Expected key-value pairs after rows");
+    for (i = 0; i < count; i += 2) {
+        STRLEN len;
+        const char *key = SvPV(args[i], len);
+        SSize_t j;
+        AV *av;
+        if (len != 9 || memcmp(key, "positions", 9))
+            croak("Unknown encode option: %.*s", (int)len, key);
+        SvGETMAGIC(args[i + 1]);
+        if (!SvROK(args[i + 1]) || SvTYPE(SvRV(args[i + 1])) != SVt_PVAV)
+            croak("positions must be an arrayref");
+        av = (AV *)SvRV(args[i + 1]);
+        if (av_len(av) + 1 != enc->num_columns)
+            croak("positions length must equal the number of columns (%d)", enc->num_columns);
+        if (!positions) {
+            Newx(positions, enc->num_columns ? enc->num_columns : 1, SSize_t);
+            SAVEFREEPV(positions);
+        }
+        for (j = 0; j < enc->num_columns; j++) {
+            SV **slot = av_fetch(av, j, 0);
+            STRLEN k, n;
+            const char *s;
+            UV value = 0;
+            if (!slot) croak("positions entries must be non-negative integers");
+            SvGETMAGIC(*slot);
+            if (!SvOK(*slot) || SvROK(*slot)) croak("positions entries must be non-negative integers");
+            s = SvPV(*slot, n);
+            if (!looks_like_int_str(s, n) || *s == '-')
+                croak("positions entries must be non-negative integers");
+            for (k = *s == '+' ? 1 : 0; k < n; k++) {
+                UV digit = s[k] - '0';
+                if (value > ((UV)SSize_t_MAX - 1 - digit) / 10)
+                    croak("positions entry out of range");
+                value = value * 10 + digit;
+            }
+            positions[j] = (SSize_t)value;
+        }
+    }
+    return positions;
+}
+
 MODULE = ClickHouse::Encoder  PACKAGE = ClickHouse::Encoder
 
 PROTOTYPES: DISABLE
@@ -53,6 +97,8 @@ CODE:
     AV *cols_av;
     SSize_t i, n;
     SV *cols_sv = NULL;
+    const char *timezone = "UTC";
+    int empty_as_null = 0;
 
     if (items % 2 == 0)
         croak("Expected key-value pairs");
@@ -62,6 +108,16 @@ CODE:
         const char *key = SvPV(ST(i), klen);
         if (klen == 7 && memcmp(key, "columns", 7) == 0)
             cols_sv = ST(i+1);
+        else if (klen == 8 && memcmp(key, "timezone", 8) == 0) {
+            STRLEN len;
+            const char *name;
+            SvGETMAGIC(ST(i+1));
+            if (!SvOK(ST(i+1))) croak("timezone must be a name");
+            name = SvPV_nomg(ST(i+1), len);
+            if (!len || memchr(name, 0, len)) croak("Invalid timezone name");
+            timezone = SvPVX(sv_2mortal(newSVpvn(name, len)));
+        } else if (klen == 13 && memcmp(key, "empty_as_null", 13) == 0)
+            empty_as_null = SvTRUE(ST(i+1));
     }
 
     if (!cols_sv || !SvROK(cols_sv) || SvTYPE(SvRV(cols_sv)) != SVt_PVAV)
@@ -111,6 +167,7 @@ CODE:
         enc->columns[i].type = parse_type(aTHX_ enc->columns[i].type_str, len);
     }
 
+    configure_encoder(aTHX_ enc, timezone, empty_as_null);
     RETVAL = newSV(0);
     sv_setref_pv(RETVAL, class, (void*)enc);
     enc = NULL;  /* Disarm: the SV's DESTROY now owns the encoder. */
@@ -120,7 +177,7 @@ OUTPUT:
     RETVAL
 
 SV*
-encode(self, rows)
+encode(self, rows, ...)
     SV *self
     SV *rows
 CODE:
@@ -134,14 +191,15 @@ CODE:
 
     enc = INT2PTR(Encoder*, SvIV(SvRV(self)));
     buf_init(aTHX_ &buf);
-    do_encode(aTHX_ enc, (AV *)SvRV(rows), &buf);
+    do_encode(aTHX_ enc, (AV *)SvRV(rows), &buf,
+              encode_positions(aTHX_ enc, items - 2, &ST(2)));
     RETVAL = newSVpvn(buf.ptr, buf.len);
 }
 OUTPUT:
     RETVAL
 
 void
-encode_into(self, target_ref, rows)
+encode_into(self, target_ref, rows, ...)
     SV *self
     SV *target_ref
     SV *rows
@@ -161,14 +219,15 @@ CODE:
     enc = INT2PTR(Encoder*, SvIV(SvRV(self)));
 
     buf_init(aTHX_ &buf);
-    do_encode(aTHX_ enc, (AV *)SvRV(rows), &buf);
+    do_encode(aTHX_ enc, (AV *)SvRV(rows), &buf,
+              encode_positions(aTHX_ enc, items - 3, &ST(3)));
 
     if (!SvOK(target)) sv_setpvn(target, "", 0);
     sv_catpvn(target, buf.ptr, buf.len);
 }
 
 void
-encode_to_handle(self, fh, rows)
+encode_to_handle(self, fh, rows, ...)
     SV *self
     SV *fh
     SV *rows
@@ -189,7 +248,8 @@ CODE:
 
     enc = INT2PTR(Encoder*, SvIV(SvRV(self)));
     buf_init(aTHX_ &buf);
-    do_encode(aTHX_ enc, (AV *)SvRV(rows), &buf);
+    do_encode(aTHX_ enc, (AV *)SvRV(rows), &buf,
+              encode_positions(aTHX_ enc, items - 3, &ST(3)));
 
     if (PerlIO_write(pio, buf.ptr, buf.len) != (SSize_t)buf.len)
         croak("encode_to_handle: short write: %s", strerror(errno));
@@ -429,6 +489,22 @@ CODE:
 }
 OUTPUT:
     RETVAL
+
+void
+_options(self)
+    SV *self
+PPCODE:
+{
+    Encoder *enc;
+    if (!sv_isobject(self))
+        croak("Not an object");
+    enc = INT2PTR(Encoder*, SvIV(SvRV(self)));
+    EXTEND(SP, 4);
+    mPUSHs(newSVpvs("timezone"));
+    mPUSHs(newSVpv(enc->timezone, 0));
+    mPUSHs(newSVpvs("empty_as_null"));
+    mPUSHs(newSViv(enc->empty_as_null));
+}
 
 void
 DESTROY(self)

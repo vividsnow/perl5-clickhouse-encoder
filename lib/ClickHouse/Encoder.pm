@@ -2,7 +2,7 @@ package ClickHouse::Encoder;
 use strict;
 use warnings;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 require XSLoader;
 XSLoader::load('ClickHouse::Encoder', $VERSION);
@@ -220,7 +220,12 @@ sub _for_describe {
     }
 
     die "No columns found for: $describe_sql" unless @columns;
-    return $class->new(columns => \@columns);
+    return $class->new(columns => \@columns, _encoder_options(%opts));
+}
+
+sub _encoder_options {
+    my (%opts) = @_;
+    return map { defined $opts{$_} ? ($_ => $opts{$_}) : () } qw(timezone empty_as_null);
 }
 
 sub columns {
@@ -1102,8 +1107,9 @@ sub _rb_assert_scalar {
 *_rb_pack_string   = \&ClickHouse::Encoder::TCP::pack_string;
 ## use critic
 
-# Encode one value of $type into RowBinary bytes. $cache memoises the
-# single-column Native encoder + value-region offset per scalar type.
+# Encode one value of $type into RowBinary bytes. $cache holds the
+# parent encoder's options and memoises the single-column Native encoder
+# + value-region offset per scalar type.
 sub _rb_encode_value {
     my ($type, $val, $cache) = @_;
     if ($type =~ /\AArray\((.+)\)\z/s) {
@@ -1117,22 +1123,19 @@ sub _rb_encode_value {
     if ($type =~ /\ALowCardinality\((.+)\)\z/s) {
         return _rb_encode_value($1, $val, $cache);
     }
-    # The one shape the Native-slice trick cannot express: RowBinary omits
-    # the value when the flag says null, Native always emits a placeholder.
-    if ($type =~ /\ANullable\((.+)\)\z/s) {
-        return "\x01" if !defined $val;
-        return "\x00" . _rb_encode_value($1, $val, $cache);
-    }
     _rb_assert_scalar($type);
-    my $slot = $cache->{$type} ||= do {
-        my $enc = ClickHouse::Encoder->new(columns => [['c', $type]]);
+    my $slot = $cache->{types}{$type} ||= do {
+        my $enc = ClickHouse::Encoder->new(columns => [['c', $type]],
+                                           @{ $cache->{options} });
         # One-row, one-column Native block prefix:
         #   varint(ncols=1) varint(nrows=1) lenstr("c") lenstr(type)
         my $prefix = 2 + length(_rb_pack_string('c'))
                        + length(_rb_pack_string($type));
         [$enc, $prefix];
     };
-    return substr($slot->[0]->encode([[ $val ]]), $slot->[1]);
+    my $bytes = substr($slot->[0]->encode([[ $val ]]), $slot->[1]);
+    # RowBinary omits the value when the null flag is set; Native keeps a placeholder.
+    return $type =~ /\ANullable\(/ && $bytes =~ /\A\x01/ ? "\x01" : $bytes;
 }
 
 # Encode an arrayref of rows into a RowBinary byte string. Call on an
@@ -1143,7 +1146,7 @@ sub encode_row_binary {
     die "encode_row_binary: rows must be an arrayref\n"
         unless ref $rows eq 'ARRAY';
     my $cols = $self->columns;
-    my %cache;
+    my %cache = (options => [$self->_options]);
     my $out = '';
     for my $ri (0 .. $#$rows) {
         my $row = $rows->[$ri];
@@ -1502,7 +1505,7 @@ sub insert_http {
     my ($class_or_self, %args) = @_;
     my $enc      = $args{encoder} // do {
         my $cols = $args{columns} or die "insert_http needs columns or encoder";
-        $class_or_self->new(columns => $cols);
+        $class_or_self->new(columns => $cols, _encoder_options(%args));
     };
     my $rows     = $args{rows}  or die "insert_http needs rows arrayref";
     my $table    = $args{table} or die "insert_http needs table";
@@ -1671,7 +1674,7 @@ sub new {
                      || 'ClickHouse::Encoder';
     my $enc        = $args{encoder} // do {
         my $cols = $args{columns} or die "bulk_inserter needs columns or encoder";
-        $origin->new(columns => $cols);
+        $origin->new(columns => $cols, ClickHouse::Encoder::_encoder_options(%args));
     };
     my $table      = $args{table} or die "bulk_inserter needs table";
     my $compress   = $args{compress} // 'raw';
@@ -1979,6 +1982,16 @@ C<columns> is an arrayref of C<[$name, $type]> pairs. The C<$type> string
 must match the syntax ClickHouse uses in C<describe table> output (see
 L</TYPES>).
 
+C<timezone =E<gt> 'Area/City'> sets the timezone for wall-time strings in
+columns without an explicit timezone (default UTC). Timezone data comes from
+C<TZDIR>, or the system C<zoneinfo> directories. This option is loaded at
+construction; a column's own zone is loaded on the first wall-time string
+that needs it. Unknown zones or missing data croak then. C<UTC>,
+C<Etc/UTC>, and C<GMT> need no database.
+C<empty_as_null =E<gt> 1> enables empty-string NULL coercion (default off).
+See L</Value coercion>. These options also pass through C<for_table>,
+C<for_query>, C<insert_http>, and C<bulk_inserter> when they build an encoder.
+
 Croaks on unknown or malformed types, on C<Nullable(Nullable(...))>, on
 empty enum names, on enum values out of range, on C<FixedString(0)>, and
 on out-of-range C<Decimal*> / C<DateTime64> parameters.
@@ -1992,6 +2005,11 @@ of arrayrefs; each inner arrayref must have exactly as many elements as the
 encoder's columns. Croaks if a row's shape is wrong, if a value can't be
 coerced to its column type, or on string parse errors (see L</Value
 coercion>).
+
+With C<positions =E<gt> [7, 2, 11]>, column C<j> reads row position
+C<< $positions->[j] >>. Supply one non-negative integer per column; rows
+may be wider but must contain every selected position. The same option
+is accepted by C<encode_into> and C<encode_to_handle>.
 
 =head2 encode_columns
 
@@ -2579,7 +2597,7 @@ request body for C<insert ... format RowBinary>). Native is the
 preferred format and is what the rest of this module uses;
 C<RowBinary> is offered for interoperability with producers and
 pipelines that speak it. Call on an encoder instance - its column
-types drive serialisation.
+types and its C<timezone> / C<empty_as_null> options drive serialisation.
 
 Supported column types: every scalar type
 (C<Int*>/C<UInt*>/C<Float*>/C<Bool>/C<Date*>/C<DateTime*>/
@@ -2948,8 +2966,8 @@ is by byte not codepoint.
 
 =item *
 
-Dates: C<Date>, C<Date32>, C<DateTime>, C<DateTime('tz')> (timezone is part
-of the schema, not the value), C<DateTime64(P)> with C<P> in 0..9.
+Dates: C<Date>, C<Date32>, C<DateTime>, C<DateTime('tz')>, and
+C<DateTime64(P[, 'tz'])> with C<P> in 0..9.
 
 =item *
 
@@ -2994,8 +3012,7 @@ match either way.
 
 =item *
 
-C<LowCardinality(String)>, C<LowCardinality(FixedString(N))>,
-C<LowCardinality(Nullable(String))>, C<LowCardinality(Nullable(FixedString(N)))>.
+C<LowCardinality(T)> for scalar C<T>, including C<Nullable(T)>.
 
 =item *
 
@@ -3126,8 +3143,7 @@ here - use a JSON column for object-shaped values.
 
 =head2 Not currently supported
 
-C<LowCardinality(T)> for non-string T, C<AggregateFunction> (per-function
-binary state).
+C<AggregateFunction> (per-function binary state).
 
 Heterogeneous arrays as JSON leaves (e.g. C<<< [1, "two"] >>>); only
 homogeneous arrays of C<Bool> / C<Float64> / C<Int64> / C<String>
@@ -3154,7 +3170,7 @@ returns the flat columns.
 =item *
 
 Integer inputs must be numeric and fit the column's signed or unsigned
-range. Nonnumeric values, negative unsigned values and overflow croak.
+range. Non-numeric values, negative unsigned values and overflow croak.
 Floating-point inputs truncate toward zero after range validation.
 
 =item *
@@ -3183,11 +3199,18 @@ range it rejects is the range ClickHouse rejects too.)
 
 =item *
 
-C<DateTime>: integer is Unix seconds; a C<YYYY-MM-DD HH:MM:SS> string is
-parsed. ISO 8601 forms are accepted: the C<T> separator, plus an optional
+C<DateTime>: integer is Unix seconds; a C<YYYY-MM-DD HH:MM:SS>,
+C<YYYY-MM-DD HH:MM> or C<YYYY-MM-DD> string is parsed, and other time
+shapes croak. ISO 8601 forms are accepted: the C<T> separator, plus an optional
 trailing timezone marker (C<Z>, C<+HH:MM>, C<-HH:MM>, C<+HHMM>, C<+HH>,
 C<-HH>) is applied to convert to UTC. Pass date-objects via their
 C<< ->epoch >>.
+
+Wall-time strings without an offset use the column timezone, else the
+constructor's C<timezone>, else UTC. This also applies to C<DateTime64>
+and date-only strings. DST gaps move backward and folds choose the first
+occurrence, matching ClickHouse. Explicit offsets and numeric instants
+are unaffected.
 
 =item *
 
@@ -3202,23 +3225,50 @@ wrapping to a negative tick count.
 
 =item *
 
-C<Decimal*>: a number goes through C<double> (lossy past 2^53); a
-B<string> matching C<[+-]?digits[.digits]?> is parsed digit-by-digit and
-scaled exactly. B<If precision matters, pass strings.>
+C<Decimal*>: a number goes through C<double> (lossy past 2^53); strings
+are scaled exactly, including exponent forms such as C<2.9e-05>,
+C<1.e2>, and C<.5E+1>. Surplus fractional digits truncate toward zero.
+Values with more than C<P - S> integer digits croak, as ClickHouse
+rejects them in text formats. B<If precision matters, pass strings.>
 
 =item *
 
-C<Enum8> / C<Enum16>: accept either the declared name or its integer
-value; mixing the two within a column is fine.
+C<Enum8> / C<Enum16>: labels take precedence over codes, including for
+numeric inputs when an integer-looking label matches. Codes must be
+declared in the type; undeclared or out-of-range codes croak. C<undef>
+is the type's default, its smallest declared code.
+
+=item *
+
+C<IPv6> accepts dotted IPv4 strings as IPv4-mapped addresses
+(C<1.2.3.4> becomes C<::ffff:1.2.3.4>).
 
 =item *
 
 C<Nullable(T)>: C<undef> writes a null-bitmap entry plus a type-shaped
 placeholder (zero scalar, empty array, or a recursive zero tuple).
+With C<empty_as_null =E<gt> 1>, a defined empty string also writes NULL
+unless C<T> is C<String> or C<FixedString>. This applies in nested types
+and C<LowCardinality(Nullable(T))> too.
 
 =back
 
 =head1 EXAMPLES
+
+=head2 Event-loop programs
+
+Encode a batch and send it with an existing L<EV::ClickHouse> connection
+as one asynchronous query:
+
+    my $bytes = $enc->encode(\@rows);
+    $ch->query("insert into t (a, b) format Native\n" . $bytes,
+        { input_format_null_as_default => 1 }, $cb);
+
+Nullable input columns allow ClickHouse to evaluate column DEFAULT
+expressions for NULL values with this setting. Send uncompressed bytes;
+the C<EV::ClickHouse> C<compress> option does not apply to this route.
+
+=head2 Example scripts
 
 The F<eg/> directory ships runnable scripts:
 
