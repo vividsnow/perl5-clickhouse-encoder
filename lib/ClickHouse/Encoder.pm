@@ -2,7 +2,7 @@ package ClickHouse::Encoder;
 use strict;
 use warnings;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 require XSLoader;
 XSLoader::load('ClickHouse::Encoder', $VERSION);
@@ -148,6 +148,140 @@ sub for_table {
     return $class->_for_describe("describe table $table", %opts);
 }
 
+sub from_columns {
+    my ($class, $rows, %opts) = @_;
+    die "from_columns: rows must be an arrayref\n" unless ref($rows) eq 'ARRAY';
+    my (@columns, %defaults, %expressions);
+    for my $row (@$rows) {
+        my ($name, $type, $kind, $expr);
+        if (ref($row) eq 'ARRAY') {
+            ($name, $type, $kind, $expr) = @$row;
+        } elsif (ref($row) eq 'HASH') {
+            ($name, $type, $kind, $expr) = @$row{qw(name type default_kind default_expression)};
+        } else {
+            die "from_columns: each row must be an arrayref or hashref\n";
+        }
+        die "from_columns: each row needs name and type\n" unless defined $name && defined $type;
+        next if ($kind // '') =~ /\A(?:materialized|alias|ephemeral)\z/i;
+        push @columns, [$name, $type];
+        if (($kind // '') =~ /\Adefault\z/i && defined $expr) {
+            my ($ok, $value) = _default_literal($expr);
+            if ($ok) {
+                $defaults{$name} = $value;
+            } elsif ($opts{empty_as_default}) {
+                $expressions{$name} = $expr;
+            }
+        }
+    }
+    if (exists $opts{defaults}) {
+        die "defaults must be a hashref\n" unless ref($opts{defaults}) eq 'HASH';
+        @defaults{keys %{$opts{defaults}}} = values %{$opts{defaults}};
+    }
+    return $class->new(columns => \@columns, _encoder_options(%opts), defaults => \%defaults,
+                       %expressions ? (_default_expressions => \%expressions) : ());
+}
+
+sub _literal_string {
+    my ($text) = @_;
+    return unless $$text =~ /\G'((?:[^'\\]|\\.|'')*)'/gcs;
+    my $value = $1;
+    my %esc = (n => "\n", t => "\t", r => "\r", b => "\b", f => "\f",
+               v => "\x0b", a => "\a", '0' => "\0", e => "\x1b");
+    $value =~ s{\\x([0-9a-fA-F]{2})|\\(.)|('')}{
+        defined $1 ? chr(hex($1)) : defined $2 ? ($esc{$2} // $2) : "'"
+    }ges;
+    return (1, $value);
+}
+
+sub _literal_type {
+    my ($text) = @_;
+    return unless $$text =~ /\G\s*[A-Za-z_][A-Za-z_0-9]*\s*/gc;
+    if ($$text =~ /\G\(/gc) {
+        my $depth = 1;
+        while ($depth) {
+            if ($$text =~ /\G'/gc) {
+                pos($$text)--;
+                my ($ok) = _literal_string($text);
+                return unless $ok;
+            } elsif ($$text =~ /\G\(/gc) {
+                return if ++$depth > 64;
+            } elsif ($$text =~ /\G\)/gc) {
+                $depth--;
+            } else {
+                return unless $$text =~ /\G[^()']+/gc;
+            }
+        }
+    }
+    return 1;
+}
+
+sub _literal_value {
+    my ($text, $depth) = @_;
+    return if $depth > 64;
+    $$text =~ /\G\s*/gc;
+    my ($ok, $value);
+    if ($$text =~ /\Gcast\s*\(/gci) {
+        ($ok, $value) = _literal_value($text, $depth + 1);
+        return unless $ok;
+        if ($$text =~ /\G\s*,\s*/gc) {
+            my ($type_ok) = _literal_string($text);
+            return unless $type_ok;
+        } elsif ($$text =~ /\G\s*as\b/gci) {
+            return unless _literal_type($text);
+        } else {
+            return;
+        }
+        return unless $$text =~ /\G\s*\)/gc;
+    } elsif ($$text =~ /\G'/gc) {
+        pos($$text)--;
+        ($ok, $value) = _literal_string($text);
+        return unless $ok;
+    } elsif ($$text =~ /\G([\[(])/gc) {
+        my $open = $1;
+        my $close = $open eq '[' ? ']' : ')';
+        my @values;
+        $$text =~ /\G\s*/gc;
+        unless ($$text =~ /\G\Q$close\E/gc) {
+            while (1) {
+                my ($item_ok, $item) = _literal_value($text, $depth + 1);
+                return unless $item_ok;
+                push @values, $item;
+                return if @values > 100_000;
+                $$text =~ /\G\s*/gc;
+                last if $$text =~ /\G\Q$close\E/gc;
+                return unless $$text =~ /\G,/gc;
+            }
+        }
+        $value = $open eq '(' && @values == 1 ? $values[0] : \@values;
+    } elsif ($$text =~ /\G([+-]?0[xX][0-9a-fA-F]+)/gc) {
+        my $num = $1;
+        my $negative = $num =~ s/^-//;
+        $num =~ s/^\+//;
+        require Math::BigInt;
+        my $big = Math::BigInt->from_hex($num);
+        return if $big > Math::BigInt->new('18446744073709551615');
+        $value = ($negative ? '-' : '') . $big->bstr;
+    } elsif ($$text =~ /\G([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)/gc) {
+        $value = $1;
+    } elsif ($$text =~ /\G(null|true|false)\b/gci) {
+        $value = lc($1) eq 'null' ? undef : lc($1) eq 'true' ? 1 : 0;
+    } else {
+        return;
+    }
+    while ($$text =~ /\G\s*::/gc) {
+        return unless _literal_type($text);
+    }
+    return (1, $value);
+}
+
+sub _default_literal {
+    my ($text) = @_;
+    pos($text) = 0;
+    my ($ok, $value) = _literal_value(\$text, 0);
+    return unless $ok && $text =~ /\G\s*\z/gc;
+    return (1, $value);
+}
+
 sub _for_describe {
     my ($class, $describe_sql, %opts) = @_;
 
@@ -225,7 +359,7 @@ sub _for_describe {
 
 sub _encoder_options {
     my (%opts) = @_;
-    return map { defined $opts{$_} ? ($_ => $opts{$_}) : () } qw(timezone empty_as_null);
+    return map { defined $opts{$_} ? ($_ => $opts{$_}) : () } qw(timezone empty_as_null empty_as_default defaults);
 }
 
 sub columns {
@@ -1989,7 +2123,11 @@ construction; a column's own zone is loaded on the first wall-time string
 that needs it. Unknown zones or missing data croak then. C<UTC>,
 C<Etc/UTC>, and C<GMT> need no database.
 C<empty_as_null =E<gt> 1> enables empty-string NULL coercion (default off).
-See L</Value coercion>. These options also pass through C<for_table>,
+C<defaults =E<gt> { name =E<gt> $value }> replaces empty column values with
+C<$value>, using the column's usual encoder; unknown names croak at construction.
+C<empty_as_default =E<gt> 1> supplies type defaults in other non-Nullable
+columns (default off). See L</Value coercion> for the empty-value rule.
+These options also pass through C<for_table>,
 C<for_query>, C<insert_http>, and C<bulk_inserter> when they build an encoder.
 
 Croaks on unknown or malformed types, on C<Nullable(Nullable(...))>, on
@@ -2008,8 +2146,21 @@ coercion>).
 
 With C<positions =E<gt> [7, 2, 11]>, column C<j> reads row position
 C<< $positions->[j] >>. Supply one non-negative integer per column; rows
-may be wider but must contain every selected position. The same option
+may be wider, and positions past the end read as C<undef>. The same option
 is accepted by C<encode_into> and C<encode_to_handle>.
+
+=head2 from_columns
+
+    my $enc = ClickHouse::Encoder->from_columns(\@rows, %opts);
+
+Builds an encoder without I/O from C<system.columns>-shaped arrayrefs
+C<[$name, $type, $default_kind, $default_expression]> or hashrefs with those
+keys. Skips C<MATERIALIZED>, C<ALIAS>, and C<EPHEMERAL> columns. Literal
+C<DEFAULT> expressions (numbers, escaped strings, NULL, booleans, arrays,
+tuples, and C<cast(literal, 'T')> / C<literal::T>) supply C<defaults>.
+With C<empty_as_default>, a non-literal expression croaks only when an
+empty value needs it; pass C<defaults> to supply its value. Caller entries win.
+C<%opts> accepts the normal C<new> options.
 
 =head2 encode_columns
 
@@ -3166,6 +3317,29 @@ returns the flat columns.
 =head2 Value coercion
 
 =over 4
+
+=item *
+
+Column defaults replace C<undef> and C<''>, except C<''> is a value in
+C<String>/C<FixedString> (including LowCardinality); Nullable columns keep
+their NULL rules. Defaults apply only to top-level column values.
+
+=item *
+
+Type defaults are what an empty CSV cell stores: zero/empty scalars and
+containers (dates at 1970-01-01), the smallest Enum code, recursive
+Tuple defaults and the inner LowCardinality default; JSON is C<{}>,
+Variant/Dynamic NULL.
+
+=item *
+
+C<Array> and C<Map> accept C<undef> or C<''> as an empty container,
+including inside Tuples and other containers.
+
+=item *
+
+C<String> and C<FixedString> reject references unless the object overloads
+stringification, including through Nullable and LowCardinality wrappers.
 
 =item *
 

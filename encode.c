@@ -28,6 +28,7 @@
  * Leaf types get a defined zero/empty SV (not &PL_sv_undef) so that the
  * encoder doesn't warn about uninit values when filling padding bytes. */
 static SV *make_null_placeholder(pTHX_ TypeInfo *t) {
+    if (t->code == T_NULLABLE) return &PL_sv_undef;
     if (t->code == T_ARRAY || t->code == T_MAP) {
         AV *empty = newAV();
         return sv_2mortal(newRV_noinc((SV*)empty));
@@ -66,6 +67,16 @@ static int enum_lookup_name(pTHX_ TypeInfo *t, const char *s, STRLEN slen, int16
 
 int nullable_is_null(SV *value, TypeInfo *t) {
     return !SvOK(value) || (t->empty_as_null && SvPOK(value) && !SvCUR(value));
+}
+
+static int empty_container(SV *value) {
+    return !SvOK(value) || (!SvROK(value) && SvPOK(value) && !SvCUR(value));
+}
+
+static void check_string_reference(pTHX_ SV *value, TypeInfo *t) {
+    if (SvROK(value) && !(SvAMAGIC(value) && gv_handler(SvSTASH(SvRV(value)), string_amg)))
+        croak("%s cannot encode a reference without string overloading",
+              t->code == T_FIXEDSTRING ? "FixedString" : "String");
 }
 
 static int16_t enum_value(pTHX_ TypeInfo *t, SV *val) {
@@ -196,6 +207,7 @@ void encode_scalar(pTHX_ Buffer *b, SV *val, TypeInfo *t) {
             break;
         }
         case T_STRING: {
+            check_string_reference(aTHX_ val, t);
             if (!SvOK(val)) {
                 buf_varint(aTHX_ b,0);
             } else {
@@ -206,6 +218,7 @@ void encode_scalar(pTHX_ Buffer *b, SV *val, TypeInfo *t) {
             break;
         }
         case T_FIXEDSTRING: {
+            check_string_reference(aTHX_ val, t);
             buf_grow(aTHX_ b,t->param);
             if (!SvOK(val)) {
                 memset(b->ptr + b->len, 0, t->param);
@@ -871,6 +884,10 @@ static void encode_column_data(pTHX_ Buffer *b, Buffer *prefix,
 
             for (r = 0; r < num_rows; r++) {
                 SV *val = values[r];
+                if (empty_container(val)) {
+                    buf_le64(aTHX_ b, offset);
+                    continue;
+                }
                 if (!SvROK(val) || SvTYPE(SvRV(val)) != SVt_PVAV)
                     croak("Expected arrayref for Array type");
                 AV *av = (AV*)SvRV(val);
@@ -884,6 +901,7 @@ static void encode_column_data(pTHX_ Buffer *b, Buffer *prefix,
                 SV **all_elems = alloc_sv_array(aTHX_ total_elems);
                 SSize_t idx = 0;
                 for (r = 0; r < num_rows; r++) {
+                    if (empty_container(values[r])) continue;
                     AV *av = (AV*)SvRV(values[r]);
                     SSize_t n = av_len(av) + 1;
                     SSize_t i;
@@ -964,6 +982,10 @@ static void encode_column_data(pTHX_ Buffer *b, Buffer *prefix,
             SV **norm = alloc_sv_array(aTHX_ num_rows);
             for (r = 0; r < num_rows; r++) {
                 SV *val = values[r];
+                if (empty_container(val)) {
+                    norm[r] = sv_2mortal(newRV_noinc((SV *)newAV()));
+                    continue;
+                }
                 if (!SvROK(val))
                     croak("Expected hashref or arrayref for Map type");
                 SV *rv = SvRV(val);
@@ -1162,6 +1184,7 @@ static void encode_column_data(pTHX_ Buffer *b, Buffer *prefix,
                     if (is_null) { indices[r] = 0; continue; }
                     val = make_null_placeholder(aTHX_ leaf);
                 }
+                if (!numeric) check_string_reference(aTHX_ val, leaf);
                 STRLEN slen = 0;
                 const char *s = numeric ? NULL : SvPV(val, slen);
                 const char *key;

@@ -99,6 +99,9 @@ CODE:
     SV *cols_sv = NULL;
     const char *timezone = "UTC";
     int empty_as_null = 0;
+    int empty_as_default = 0;
+    HV *defaults = NULL;
+    HV *expressions = NULL;
 
     if (items % 2 == 0)
         croak("Expected key-value pairs");
@@ -118,6 +121,19 @@ CODE:
             timezone = SvPVX(sv_2mortal(newSVpvn(name, len)));
         } else if (klen == 13 && memcmp(key, "empty_as_null", 13) == 0)
             empty_as_null = SvTRUE(ST(i+1));
+        else if (klen == 16 && memcmp(key, "empty_as_default", 16) == 0)
+            empty_as_default = SvTRUE(ST(i+1));
+        else if (klen == 8 && memcmp(key, "defaults", 8) == 0) {
+            SvGETMAGIC(ST(i+1));
+            if (!SvROK(ST(i+1)) || SvTYPE(SvRV(ST(i+1))) != SVt_PVHV)
+                croak("defaults must be a hashref");
+            defaults = (HV *)SvRV(ST(i+1));
+        } else if (klen == 20 && memcmp(key, "_default_expressions", 20) == 0) {
+            SvGETMAGIC(ST(i+1));
+            if (!SvROK(ST(i+1)) || SvTYPE(SvRV(ST(i+1))) != SVt_PVHV)
+                croak("_default_expressions must be a hashref");
+            expressions = (HV *)SvRV(ST(i+1));
+        }
     }
 
     if (!cols_sv || !SvROK(cols_sv) || SvTYPE(SvRV(cols_sv)) != SVt_PVAV)
@@ -168,6 +184,7 @@ CODE:
     }
 
     configure_encoder(aTHX_ enc, timezone, empty_as_null);
+    configure_defaults(aTHX_ enc, empty_as_default, defaults, expressions);
     RETVAL = newSV(0);
     sv_setref_pv(RETVAL, class, (void*)enc);
     enc = NULL;  /* Disarm: the SV's DESTROY now owns the encoder. */
@@ -318,9 +335,9 @@ CODE:
                  * tied per-column AVs return magical placeholders that
                  * downstream SvIV / SvPV won't see until SvGETMAGIC. */
                 SvGETMAGIC(*e);
-                col_values[r] = *e;
+                col_values[r] = column_value(aTHX_ col, *e);
             } else {
-                col_values[r] = &PL_sv_undef;
+                col_values[r] = column_value(aTHX_ col, &PL_sv_undef);
             }
         }
         encode_column(aTHX_ &buf, col_values, num_rows, col->type);

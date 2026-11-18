@@ -43,6 +43,7 @@ SUPPORTED TYPES
     See `perldoc ClickHouse::Encoder` for value coercion rules and limits.
 
 OUTPUT APIS
+    from_columns(\@system_columns_rows)   build an encoder without I/O
     encode(\@rows)                        return Native bytes for one block
     encode_into(\$buf, \@rows)            append a block to an existing scalar
     encode_columns(\%cols)                column-oriented input (same bytes)

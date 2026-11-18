@@ -8,6 +8,7 @@
 #include "encode.h"
 #include "runtime.h"
 #include "datetime.h"
+#include "scalar_kind.h"
 
 static void configure_type(pTHX_ Encoder *enc, TypeInfo *t,
                             CHTimezone *default_tz, int empty_as_null) {
@@ -35,6 +36,71 @@ void configure_encoder(pTHX_ Encoder *enc, const char *timezone, int empty_as_nu
 
 #define CHE_GATHER_COLUMNS 16
 
+static SV *type_default(pTHX_ TypeInfo *t) {
+    int i;
+    AV *av;
+    switch (t->code) {
+        case T_NULLABLE: case T_VARIANT: case T_DYNAMIC:
+        case T_ENUM8: case T_ENUM16:
+            return sv_2mortal(newSV(0));
+        case T_LOWCARDINALITY:
+            return type_default(aTHX_ t->inner);
+        case T_ARRAY: case T_MAP:
+            return sv_2mortal(newRV_noinc((SV *)newAV()));
+        case T_TUPLE:
+            av = (AV *)sv_2mortal((SV *)newAV());
+            for (i = 0; i < t->tuple_len; i++)
+                av_push(av, SvREFCNT_inc(type_default(aTHX_ t->tuple[i])));
+            return sv_2mortal(newRV_inc((SV *)av));
+        case T_JSON:
+            return sv_2mortal(newRV_noinc((SV *)newHV()));
+        case T_STRING: case T_FIXEDSTRING:
+            return sv_2mortal(newSVpvs(""));
+        case T_UUID: case T_IPV6:
+            return sv_2mortal(newSVpvn("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16));
+        default:
+            return sv_2mortal(newSViv(0));
+    }
+}
+
+void configure_defaults(pTHX_ Encoder *enc, int empty_as_default, HV *defaults, HV *expressions) {
+    int c;
+    HE *entry;
+    if (defaults) {
+        HV *snapshot = (HV *)sv_2mortal((SV *)newHV());
+        hv_iterinit(defaults);
+        while ((entry = hv_iternext(defaults))) {
+            SV *key = hv_iterkeysv(entry);
+            SV *value;
+            STRLEN len;
+            const char *name = SvPV(key, len);
+            for (c = 0; c < enc->num_columns; c++)
+                if (enc->columns[c].name_len == len && !memcmp(enc->columns[c].name, name, len)) break;
+            if (c == enc->num_columns)
+                croak("defaults key '%.*s' matches no column", (int)len, name);
+            value = hv_iterval(defaults, entry);
+            hv_store_ent(snapshot, key, newSVsv(value), 0);
+        }
+        defaults = snapshot;
+    }
+    for (c = 0; c < enc->num_columns; c++) {
+        Column *col = &enc->columns[c];
+        TypeInfo *t = col->type;
+        SV **value = defaults ? fetch_named_value(aTHX_ defaults, col->name, col->name_len) : NULL;
+        while (t->code == T_LOWCARDINALITY) t = t->inner;
+        if (t->code == T_NULLABLE) continue;
+        col->default_flags = t->code != T_STRING && t->code != T_FIXEDSTRING ? DEFAULT_EMPTY_STRING : 0;
+        if (value) col->default_value = newSVsv(*value);
+        else if (empty_as_default) {
+            SV **expr = expressions ? fetch_named_value(aTHX_ expressions, col->name, col->name_len) : NULL;
+            if (expr) {
+                col->default_flags |= DEFAULT_EXPRESSION;
+                col->default_value = newSVsv(*expr);
+            } else col->default_value = newSVsv(type_default(aTHX_ col->type));
+        }
+    }
+}
+
 typedef struct {
     Buffer data, nulls;
     TypeInfo *scalar;
@@ -43,7 +109,7 @@ typedef struct {
 
 static SV *row_value(pTHX_ AV *row, SSize_t pos, AV *owned) {
     int magical = SvMAGICAL(row);
-    SV **slot = magical ? av_fetch(row, pos, 0)
+    SV **slot = magical ? pos <= av_len(row) ? av_fetch(row, pos, 0) : NULL
                         : pos <= AvFILLp(row) ? AvARRAY(row) + pos : NULL;
     SV *value = slot && *slot ? *slot : &PL_sv_undef;
     if (magical || SvGMAGICAL(value)) {
@@ -62,11 +128,6 @@ void do_encode(pTHX_ Encoder *enc, AV *rows_av, Buffer *buf, const SSize_t *posi
     SV **gathered;
     RowColumn *states = NULL;
     AV *owned;
-    if (positions) {
-        required = 0;
-        for (c = 0; c < enc->num_columns; c++)
-            if (positions[c] >= required) required = positions[c] + 1;
-    }
 
     /* Validate every row up front and cache the dereffed AV*. Caching
      * avoids a second av_fetch per row in the column loop and removes
@@ -93,9 +154,9 @@ void do_encode(pTHX_ Encoder *enc, AV *rows_av, Buffer *buf, const SSize_t *posi
             croak("Row %" IVdf " must be arrayref", (IV)r);
         row_av = (AV*)SvRV(*row_sv);
         row_cols = av_len(row_av) + 1;
-        if (positions ? row_cols < required : row_cols != required)
-            croak("Row %" IVdf " has %" IVdf " columns, expected %" IVdf "%s",
-                  (IV)r, (IV)row_cols, (IV)required, positions ? " or more" : "");
+        if (!positions && row_cols != required)
+            croak("Row %" IVdf " has %" IVdf " columns, expected %" IVdf,
+                  (IV)r, (IV)row_cols, (IV)required);
         row_avs[r] = row_av;
         if (SvMAGICAL(rows_av) || SvGMAGICAL(*row_sv))
             sv_2mortal(SvREFCNT_inc((SV *)row_av));
@@ -149,7 +210,7 @@ void do_encode(pTHX_ Encoder *enc, AV *rows_av, Buffer *buf, const SSize_t *posi
             SSize_t pos = positions ? positions[c] : c;
             SV *value;
             if (state->scalar) {
-                value = row_value(aTHX_ row, pos, NULL);
+                value = column_value(aTHX_ &enc->columns[c], row_value(aTHX_ row, pos, NULL));
                 if (state->nullable) {
                     int is_null = nullable_is_null(value, enc->columns[c].type);
                     buf_byte(aTHX_ &state->nulls, is_null);
@@ -161,7 +222,7 @@ void do_encode(pTHX_ Encoder *enc, AV *rows_av, Buffer *buf, const SSize_t *posi
                 encode_scalar(aTHX_ &state->data, value, state->scalar);
             } else if (state->complex_slot < group) {
                 value = row_value(aTHX_ row, pos, owned);
-                gathered[state->complex_slot * num_rows + r] = value;
+                gathered[state->complex_slot * num_rows + r] = column_value(aTHX_ &enc->columns[c], value);
             }
         }
         FREETMPS;
@@ -193,7 +254,7 @@ void do_encode(pTHX_ Encoder *enc, AV *rows_av, Buffer *buf, const SSize_t *posi
                     for (j = 0; j < end; j++) {
                         int column = complex_columns[index + j];
                         SSize_t pos = positions ? positions[column] : column;
-                        gathered[j * num_rows + r] = row_value(aTHX_ row, pos, owned);
+                        gathered[j * num_rows + r] = column_value(aTHX_ &enc->columns[column], row_value(aTHX_ row, pos, owned));
                     }
                 }
             }
@@ -326,6 +387,7 @@ void free_encoder(pTHX_ Encoder *enc) {
             if (enc->columns[i].name)     Safefree(enc->columns[i].name);
             if (enc->columns[i].type_str) Safefree(enc->columns[i].type_str);
             if (enc->columns[i].type)     free_typeinfo(aTHX_ enc->columns[i].type);
+            SvREFCNT_dec(enc->columns[i].default_value);
         }
         Safefree(enc->columns);
     }

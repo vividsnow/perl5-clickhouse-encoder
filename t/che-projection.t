@@ -23,8 +23,14 @@ for my $bad (undef, {}, [1, 2], [1, 2, -1], [1, 2, 1.5], [1, 2, 'x'], [1, 2, '1e
     eval { $enc->encode([], positions => $bad) };
     like($@, qr/positions/, 'invalid positions rejected for empty batch');
 }
-eval { $enc->encode([[], []], positions => [7, 2, 11]) };
-like($@, qr/Row 0 .*columns.*12/, 'short projected row identifies row and size');
+my $nullable = ClickHouse::Encoder->new(columns => [[v => 'Nullable(UInt8)'], [s => 'String']]);
+$got = eval { $nullable->encode([[], []], positions => [7, 2]) };
+is($@, '', 'short projected rows accepted');
+is($got, $nullable->encode([[undef, undef], [undef, undef]]), 'positions beyond row read as undef');
+my $defaults = ClickHouse::Encoder->new(columns => [[n => 'UInt8'], [a => 'Array(UInt8)']], defaults => {n => 7});
+$got = eval { $defaults->encode([[]], positions => [99, 88]) };
+is($@, '', 'short projected row applies defaults and container coercion');
+is($got, $defaults->encode([[7, []]]), 'missing positions use column defaults');
 $got = eval { $enc->encode([[1, 'v', 1]], positions => [0, 1, 0]) };
 is($got, $enc->encode([[1, 'v', 1]]), 'duplicate positions supported');
 
@@ -46,5 +52,15 @@ $sparse[39] = 'end';
 my $strings = ClickHouse::Encoder->new(columns => [[v => 'String'], [w => 'String']]);
 $got = eval { $strings->encode([\@sparse], positions => [8, 39]) };
 is($got, $strings->encode([['', 'end']]), 'holes in ordinary arrays retain undef coercion');
+{
+    package CHE::TiedPastEnd;
+    sub TIEARRAY { bless [], $_[0] }
+    sub FETCHSIZE { 0 }
+    sub FETCH { 'past end' }
+}
+tie my @short, 'CHE::TiedPastEnd';
+$got = eval { $strings->encode([\@short], positions => [0, 99]) };
+is($@, '', 'tied short rows accepted');
+is($got, $strings->encode([[undef, undef]]), 'past-end positions do not call tied FETCH');
 
 done_testing;
